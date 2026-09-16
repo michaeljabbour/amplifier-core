@@ -19,11 +19,25 @@
 //!
 //! **Action precedence:** Deny > AskUser > InjectContext > Modify > Continue
 //!
+//! # User notifications
+//!
+//! With a configured notification sink, `emit()` delivers each non-empty
+//! `user_message` in handler order, preserving its level and source (or the
+//! registered handler name). Delivery is independent of action aggregation.
+//! `AskUser` is excluded: its message belongs to the existing approval flow.
+//!
+//! The sink owns each attempted delivery. The message is consumed before
+//! returning the result so legacy `process_hook_result()` callers cannot
+//! display it again. Display failures are logged and do not change actions.
+//! Without a sink, existing result aggregation is unchanged; hosts must wire
+//! a display service to receive Continue/Modify and multiple notices.
+//!
 //! # Connections
 //!
 //! - [`HookHandler`](crate::traits::HookHandler) trait defines the handler contract.
 //! - [`HookResult`] and [`HookAction`] from [`crate::models`] define results.
 //! - Event names come from [`crate::events`].
+//! - [`DisplayService`](crate::traits::DisplayService) is the notification sink contract.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -32,7 +46,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::models::{HookAction, HookResult};
-use crate::traits::HookHandler;
+use crate::traits::{DisplayService, HookHandler};
 
 // ---------------------------------------------------------------------------
 // HandlerEntry -- internal storage for a registered handler
@@ -71,6 +85,9 @@ pub struct HookRegistry {
     defaults: Mutex<Option<Value>>,
     /// Monotonically increasing ID for handler entries.
     next_id: Mutex<u64>,
+    /// Optional notification-only sink for delivering `HookResult.user_message`.
+    /// See the module-level "`user_message` notification delivery" doc section.
+    notification_sink: Mutex<Option<Arc<dyn DisplayService>>>,
 }
 
 impl HookRegistry {
@@ -80,7 +97,19 @@ impl HookRegistry {
             handlers: Arc::new(Mutex::new(HashMap::new())),
             defaults: Mutex::new(None),
             next_id: Mutex::new(0),
+            notification_sink: Mutex::new(None),
         }
+    }
+
+    /// Register (or replace) the notification sink used to deliver
+    /// `HookResult.user_message` from `emit()`.
+    pub fn set_notification_sink(&self, sink: Arc<dyn DisplayService>) {
+        *self.notification_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// Stop future deliveries. An already-running delivery may still finish.
+    pub fn clear_notification_sink(&self) {
+        *self.notification_sink.lock().unwrap() = None;
     }
 
     /// Register a hook handler for an event.
@@ -209,7 +238,7 @@ impl HookRegistry {
         let mut inject_context_results: Vec<HookResult> = Vec::new();
 
         for (handler, name) in &entries {
-            let result = match handler.handle(event, current_data.clone()).await {
+            let mut result = match handler.handle(event, current_data.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
                     // Error in handler -- log and continue (matches Python behaviour).
@@ -221,6 +250,27 @@ impl HookRegistry {
                     continue;
                 }
             };
+
+            // Take one sink snapshot so replacing/clearing the service cannot
+            // consume a notice without making a delivery attempt.
+            let sink = { self.notification_sink.lock().unwrap().clone() };
+            if result.action != HookAction::AskUser {
+                if let Some(sink) = sink {
+                    if let Some(message) = result.user_message.take() {
+                        if !message.is_empty() {
+                            Self::deliver_user_message(
+                                sink,
+                                event,
+                                name,
+                                &message,
+                                result.user_message_level.as_str(),
+                                result.user_message_source.as_deref(),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
 
             // Deny short-circuits immediately
             if result.action == HookAction::Deny {
@@ -271,6 +321,24 @@ impl HookRegistry {
             action: HookAction::Continue,
             data: Some(value_to_map(&current_data)),
             ..Default::default()
+        }
+    }
+
+    /// Deliver a notice without dispatching any permission or context actions.
+    /// Sink errors are logged and leave the hook action unchanged.
+    async fn deliver_user_message(
+        sink: Arc<dyn DisplayService>,
+        event: &str,
+        handler_name: &str,
+        message: &str,
+        level: &str,
+        source: Option<&str>,
+    ) {
+        let source = source.unwrap_or(handler_name);
+        if let Err(e) = sink.show_message(message, level, source).await {
+            log::warn!(
+                "Notification sink failed to display user_message for event '{event}' (handler '{handler_name}'): {e}"
+            );
         }
     }
 
@@ -1388,5 +1456,257 @@ mod tests {
             "Unexpected serialization warning in logs: {:?}",
             logs
         );
+    }
+
+    // ---------------------------------------------------------------
+    // `user_message` notification delivery (see module-level doc section)
+    // ---------------------------------------------------------------
+
+    /// A `Continue` result carrying a `user_message` must reach a registered
+    /// notification sink exactly once. This is the core regression test for
+    /// the bug where `HookRegistry::emit` silently dropped `user_message` on
+    /// `Continue`/`Modify` results because only the final aggregate
+    /// `HookResult` (freshly constructed, with no `user_message` field) was
+    /// ever returned to callers.
+    #[tokio::test]
+    async fn emit_delivers_continue_user_message_to_sink_and_clears_it() {
+        let registry = HookRegistry::new();
+        let sink = Arc::new(crate::testing::FakeDisplayService::new());
+        registry.set_notification_sink(sink.clone());
+
+        let handler = Arc::new(SimpleHandler(HookResult {
+            action: HookAction::Continue,
+            user_message: Some("heads up".into()),
+            user_message_level: crate::models::UserMessageLevel::Warning,
+            user_message_source: Some("my-hook".into()),
+            ..Default::default()
+        }));
+        let _ = registry.register("test:event", handler, 0, Some("handler-name".into()));
+
+        let result = registry.emit("test:event", serde_json::json!({})).await;
+
+        let messages = sink.recorded_messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "user_message must be delivered exactly once"
+        );
+        assert_eq!(
+            messages[0],
+            (
+                "heads up".to_string(),
+                "warning".to_string(),
+                "my-hook".to_string()
+            )
+        );
+        // Continue's returned HookResult is a freshly constructed aggregate
+        // that never carries a handler's user_message forward; nailed down
+        // explicitly here so a future refactor can't quietly reintroduce it.
+        assert!(result.user_message.is_none());
+    }
+
+    /// `user_message_source` falls back to the handler's registered name
+    /// when the result didn't set one explicitly, so the notice always
+    /// carries *some* attributable origin.
+    #[tokio::test]
+    async fn emit_user_message_source_falls_back_to_handler_name() {
+        let registry = HookRegistry::new();
+        let sink = Arc::new(crate::testing::FakeDisplayService::new());
+        registry.set_notification_sink(sink.clone());
+
+        let handler = Arc::new(SimpleHandler(HookResult {
+            action: HookAction::Continue,
+            user_message: Some("no source set".into()),
+            ..Default::default()
+        }));
+        let _ = registry.register("test:event", handler, 0, Some("fallback-handler".into()));
+
+        registry.emit("test:event", serde_json::json!({})).await;
+
+        let messages = sink.recorded_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].2, "fallback-handler");
+    }
+
+    /// `Deny` short-circuits the pipeline but must still deliver its own
+    /// `user_message` before returning, and must clear the field from the
+    /// returned `HookResult` once a sink has taken ownership of it --
+    /// otherwise a legacy `process_hook_result()` caller downstream would
+    /// double-display the same notice.
+    #[tokio::test]
+    async fn emit_deny_user_message_is_delivered_once_and_cleared() {
+        let registry = HookRegistry::new();
+        let sink = Arc::new(crate::testing::FakeDisplayService::new());
+        registry.set_notification_sink(sink.clone());
+
+        let handler = Arc::new(SimpleHandler(HookResult {
+            action: HookAction::Deny,
+            reason: Some("blocked".into()),
+            user_message: Some("denied because reasons".into()),
+            user_message_level: crate::models::UserMessageLevel::Error,
+            ..Default::default()
+        }));
+        let _ = registry.register("test:event", handler, 0, Some("deny-handler".into()));
+
+        let result = registry.emit("test:event", serde_json::json!({})).await;
+
+        assert_eq!(result.action, HookAction::Deny);
+        let messages = sink.recorded_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].1, "error");
+        // Cleared from the returned result -- the sink is now sole owner,
+        // so a downstream process_hook_result() call cannot re-display it.
+        assert!(result.user_message.is_none());
+    }
+
+    /// `AskUser` results are exempt from sink delivery: the message is left
+    /// in place (not cleared) for the approval UI to read directly, matching
+    /// prior `process_hook_result` semantics -- this preserves existing
+    /// ask_user/approval action behaviour untouched.
+    #[tokio::test]
+    async fn emit_ask_user_user_message_is_not_delivered_or_cleared() {
+        let registry = HookRegistry::new();
+        let sink = Arc::new(crate::testing::FakeDisplayService::new());
+        registry.set_notification_sink(sink.clone());
+
+        let handler = Arc::new(SimpleHandler(HookResult {
+            action: HookAction::AskUser,
+            approval_prompt: Some("approve?".into()),
+            user_message: Some("please look at this".into()),
+            ..Default::default()
+        }));
+        let _ = registry.register("test:event", handler, 0, Some("ask-handler".into()));
+
+        let result = registry.emit("test:event", serde_json::json!({})).await;
+
+        assert_eq!(result.action, HookAction::AskUser);
+        assert!(
+            sink.recorded_messages().is_empty(),
+            "AskUser must not push a passive notification"
+        );
+        assert_eq!(result.user_message.as_deref(), Some("please look at this"));
+    }
+
+    /// Multiple handlers each carrying a `user_message` must ALL be
+    /// delivered -- none silently dropped -- regardless of their individual
+    /// `action`s. `Continue` and `Modify` both discard their per-handler
+    /// result from the final aggregate `HookResult`, which is exactly the
+    /// scenario the notification sink fixes.
+    #[tokio::test]
+    async fn emit_delivers_every_handlers_user_message_none_vanish() {
+        let registry = HookRegistry::new();
+        let sink = Arc::new(crate::testing::FakeDisplayService::new());
+        registry.set_notification_sink(sink.clone());
+
+        let continue_handler = Arc::new(SimpleHandler(HookResult {
+            action: HookAction::Continue,
+            user_message: Some("continue notice".into()),
+            ..Default::default()
+        }));
+        let modify_handler = Arc::new(SimpleHandler(HookResult {
+            action: HookAction::Modify,
+            data: Some(HashMap::new()),
+            user_message: Some("modify notice".into()),
+            ..Default::default()
+        }));
+
+        let _ = registry.register("test:event", continue_handler, 0, Some("h1".into()));
+        let _ = registry.register("test:event", modify_handler, 10, Some("h2".into()));
+
+        registry.emit("test:event", serde_json::json!({})).await;
+
+        let messages = sink.recorded_messages();
+        assert_eq!(
+            messages.len(),
+            2,
+            "both handlers' user_message must reach the sink, none vanish"
+        );
+        assert!(messages.iter().any(|m| m.0 == "continue notice"));
+        assert!(messages.iter().any(|m| m.0 == "modify notice"));
+    }
+
+    /// Without a registered sink, `user_message` on a returned `HookResult`
+    /// (e.g. `Deny`) is left untouched so a legacy caller that still runs
+    /// `process_hook_result()` against the pipeline's return value can
+    /// display it. This is what prevents the message from silently
+    /// vanishing in a deployment that hasn't wired a notification sink yet.
+    #[tokio::test]
+    async fn emit_without_sink_leaves_deny_user_message_for_legacy_fallback() {
+        let registry = HookRegistry::new();
+        // No sink registered.
+
+        let handler = Arc::new(SimpleHandler(HookResult {
+            action: HookAction::Deny,
+            reason: Some("blocked".into()),
+            user_message: Some("still here".into()),
+            ..Default::default()
+        }));
+        let _ = registry.register("test:event", handler, 0, Some("deny-handler".into()));
+
+        let result = registry.emit("test:event", serde_json::json!({})).await;
+
+        assert_eq!(result.action, HookAction::Deny);
+        assert_eq!(
+            result.user_message.as_deref(),
+            Some("still here"),
+            "with no sink registered, the message must remain for a legacy fallback consumer"
+        );
+    }
+
+    /// Empty-string `user_message` is a no-op: nothing is pushed to the sink.
+    #[tokio::test]
+    async fn emit_empty_user_message_is_not_delivered() {
+        let registry = HookRegistry::new();
+        let sink = Arc::new(crate::testing::FakeDisplayService::new());
+        registry.set_notification_sink(sink.clone());
+
+        let handler = Arc::new(SimpleHandler(HookResult {
+            action: HookAction::Continue,
+            user_message: Some(String::new()),
+            ..Default::default()
+        }));
+        let _ = registry.register("test:event", handler, 0, None);
+
+        registry.emit("test:event", serde_json::json!({})).await;
+
+        assert!(sink.recorded_messages().is_empty());
+    }
+
+    /// A sink whose `show_message` fails must not break dispatch: the error
+    /// is logged and the pipeline's action/data result is unaffected.
+    #[tokio::test]
+    async fn emit_sink_failure_does_not_affect_pipeline_result() {
+        struct FailingSink;
+        impl DisplayService for FailingSink {
+            fn show_message(
+                &self,
+                _message: &str,
+                _level: &str,
+                _source: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), crate::errors::AmplifierError>> + Send + '_>>
+            {
+                Box::pin(async {
+                    Err(crate::errors::AmplifierError::Session(
+                        crate::errors::SessionError::Other {
+                            message: "sink unavailable".to_string(),
+                        },
+                    ))
+                })
+            }
+        }
+
+        let registry = HookRegistry::new();
+        registry.set_notification_sink(Arc::new(FailingSink));
+
+        let handler = Arc::new(SimpleHandler(HookResult {
+            action: HookAction::Continue,
+            user_message: Some("will fail to display".into()),
+            ..Default::default()
+        }));
+        let _ = registry.register("test:event", handler, 0, None);
+
+        // Must not panic or hang despite the sink erroring.
+        let result = registry.emit("test:event", serde_json::json!({})).await;
+        assert_eq!(result.action, HookAction::Continue);
     }
 }

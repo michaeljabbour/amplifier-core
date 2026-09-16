@@ -138,8 +138,9 @@ impl PyCoordinator {
 
         let inner = Arc::new(amplifier_core::Coordinator::new(rust_config));
 
-        // Create the hooks registry
-        let hooks_instance = Py::new(py, PyHookRegistry::new())?;
+        // Share the coordinator's registry so Python/session emissions use
+        // the same notification sink as Rust emissions.
+        let hooks_instance = Py::new(py, PyHookRegistry::from_inner(inner.hooks_shared()))?;
         let hooks_any: Py<PyAny> = hooks_instance.clone_ref(py).into_any();
 
         // Create the cancellation token
@@ -154,7 +155,7 @@ impl PyCoordinator {
         mp.set_item("hooks", &hooks_any)?;
         mp.set_item("module-source-resolver", py.None())?;
 
-        Ok(Self {
+        let mut coordinator = Self {
             inner,
             mount_points: mp.unbind(),
             py_hooks: hooks_any,
@@ -170,12 +171,14 @@ impl PyCoordinator {
             approval_system_obj: approval_system
                 .map(|a| a.unbind())
                 .unwrap_or_else(|| py.None()),
-            display_system_obj: display_system
-                .map(|d| d.unbind())
-                .unwrap_or_else(|| py.None()),
+            display_system_obj: py.None(),
             loader_obj: py.None(),
             session_state_dict: PyDict::new(py).unbind(),
-        })
+        };
+        if let Some(display) = display_system {
+            coordinator.set_display_system(display.unbind());
+        }
+        Ok(coordinator)
     }
 
     // -----------------------------------------------------------------------

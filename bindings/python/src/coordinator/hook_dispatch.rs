@@ -5,6 +5,12 @@
 //! `_handle_user_message()`. Moving this logic into Rust eliminates the need
 //! for the Python wrapper subclass entirely.
 //!
+//! `HookRegistry::emit()` consumes notices after handing them to its display
+//! sink. This helper therefore displays only unconsumed messages (for example,
+//! directly constructed HookResults), avoiding duplicate display for callers
+//! that still process emitted results here. Approval/context processing is
+//! deliberately not invoked by the notification sink.
+//!
 //! ## Design: sync-before-async
 //!
 //! All state mutations (`current_turn_injections`, audit logging) happen

@@ -65,6 +65,19 @@ pub enum UserMessageLevel {
     Error,
 }
 
+impl UserMessageLevel {
+    /// Return the lowercase wire-format string for this level
+    /// (matches the `#[serde(rename_all = "snake_case")]` representation
+    /// and the Python `DisplaySystem.show_message(level=...)` contract).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UserMessageLevel::Info => "info",
+            UserMessageLevel::Warning => "warning",
+            UserMessageLevel::Error => "error",
+        }
+    }
+}
+
 /// Configuration field type.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
