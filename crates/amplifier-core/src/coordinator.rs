@@ -242,9 +242,17 @@ impl Coordinator {
 
     // -- App-layer service: DisplayService --
 
-    /// Set the display service (single slot).
+    /// Set the display service and the hook registry's notification-only sink.
+    /// Action processing remains the orchestrator's responsibility.
     pub fn set_display_service(&self, service: Arc<dyn DisplayService>) {
+        self.hooks.set_notification_sink(service.clone());
         *self.display_service.lock().unwrap() = Some(service);
+    }
+
+    /// Stop future notifications and release the mounted display service.
+    pub fn clear_display_service(&self) {
+        self.hooks.clear_notification_sink();
+        *self.display_service.lock().unwrap() = None;
     }
 
     /// Get the display service, if mounted.
@@ -865,6 +873,41 @@ mod tests {
         let display = Arc::new(crate::testing::FakeDisplayService::new());
         coord.set_display_service(display);
         assert!(coord.display_service().is_some());
+    }
+
+    /// Mounting a display service also enables hook notice delivery.
+    #[tokio::test]
+    async fn set_display_service_wires_hook_registry_user_message_delivery() {
+        let coord = Coordinator::new_for_test();
+        let display = Arc::new(crate::testing::FakeDisplayService::new());
+        coord.set_display_service(display.clone());
+
+        let handler = Arc::new(crate::testing::FakeHookHandler::with_result(
+            crate::models::HookResult {
+                action: crate::models::HookAction::Continue,
+                user_message: Some("session notice".to_string()),
+                user_message_level: crate::models::UserMessageLevel::Info,
+                ..Default::default()
+            },
+        ));
+        let _ = coord
+            .hooks()
+            .register("session:event", handler, 0, Some("session-hook".into()));
+
+        let result = coord
+            .hooks()
+            .emit("session:event", serde_json::json!({}))
+            .await;
+
+        assert_eq!(result.action, crate::models::HookAction::Continue);
+        let messages = display.recorded_messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "Continue result's user_message must reach the display service \
+             registered via set_display_service, with no extra plumbing"
+        );
+        assert_eq!(messages[0].0, "session notice");
     }
 
     #[tokio::test]

@@ -259,11 +259,11 @@ impl PyCoordinator {
 
     /// Set the display system.
     #[setter]
-    fn set_display_system(&mut self, value: Py<PyAny>) {
+    pub(super) fn set_display_system(&mut self, value: Py<PyAny>) {
         // Set or clear the Rust-side display service based on whether value is None
         match Python::try_attach(|py| -> PyResult<()> {
             if value.bind(py).is_none() {
-                // No clear method exists; setting None just keeps Python-side ref
+                self.inner.clear_display_service();
             } else {
                 let bridge = Arc::new(PyDisplayServiceBridge {
                     py_obj: value.clone_ref(py),
